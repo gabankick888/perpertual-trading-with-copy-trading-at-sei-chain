@@ -1,0 +1,191 @@
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+interface IERC20 {
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+contract SeiPerpCopyTrading {
+
+    IERC20 public immutable collateral;
+    address public admin;
+
+    uint256 public constant MAX_LEVERAGE = 20;
+    uint256 public constant PRECISION = 1e18;
+
+    struct Position {
+        uint256 margin;
+        uint256 entryPrice;
+        uint256 leverage;
+        uint256 market;
+        bool isLong;
+        bool open;
+    }
+
+    mapping(address => mapping(uint256 => Position))
+        public positions;
+
+    mapping(uint256 => uint256) public prices;
+
+    mapping(address => address) public copyLeader;
+
+    mapping(address => uint256) public totalProfit;
+
+    event PositionOpened(
+        address indexed trader,
+        uint256 market,
+        bool isLong,
+        uint256 margin,
+        uint256 leverage
+    );
+
+    event PositionClosed(
+        address indexed trader,
+        uint256 market,
+        int256 pnl
+    );
+
+    event CopyLeaderSet(address follower, address leader);
+
+    modifier onlyAdmin() {
+        require(msg.sender == admin, "Not admin");
+        _;
+    }
+
+    constructor(address _collateral) {
+        collateral = IERC20(_collateral);
+        admin = msg.sender;
+    }
+
+    // Oracle update (prototype only)
+    function updatePrice(
+        uint256 market,
+        uint256 price
+    ) external onlyAdmin {
+        require(price > 0, "Invalid price");
+        prices[market] = price;
+    }
+
+    // Open long or short
+    function openPosition(
+        uint256 market,
+        uint256 margin,
+        uint256 leverage,
+        bool isLong
+    ) public {
+        require(!positions[msg.sender][market].open, "Position exists");
+        require(leverage > 0 && leverage <= MAX_LEVERAGE, "Bad leverage");
+        require(margin > 0, "Invalid margin");
+        require(prices[market] > 0, "No price");
+
+        require(
+            collateral.transferFrom(msg.sender, address(this), margin),
+            "Transfer failed"
+        );
+
+        positions[msg.sender][market] = Position({
+            margin: margin,
+            entryPrice: prices[market],
+            leverage: leverage,
+            market: market,
+            isLong: isLong,
+            open: true
+        });
+
+        emit PositionOpened(
+            msg.sender,
+            market,
+            isLong,
+            margin,
+            leverage
+        );
+    }
+
+    // Set copy trading leader
+    function setCopyLeader(address leader) external {
+        require(leader != msg.sender, "Cannot copy yourself");
+        copyLeader[msg.sender] = leader;
+        emit CopyLeaderSet(msg.sender, leader);
+    }
+
+    // Follower copies leader's current position
+    function copyPosition(
+        uint256 market,
+        uint256 followerMargin
+    ) external {
+        address leader = copyLeader[msg.sender];
+        require(leader != address(0), "No leader");
+
+        Position memory p = positions[leader][market];
+        require(p.open, "Leader has no position");
+
+        openPosition(
+            market,
+            followerMargin,
+            p.leverage,
+            p.isLong
+        );
+    }
+
+    // Calculate unrealized PnL
+    function getPnL(
+        address trader,
+        uint256 market
+    ) public view returns (int256) {
+
+        Position memory p = positions[trader][market];
+        require(p.open, "No position");
+
+        uint256 current = prices[market];
+
+        uint256 size = p.margin * p.leverage;
+
+        uint256 difference = current > p.entryPrice
+            ? current - p.entryPrice
+            : p.entryPrice - current;
+
+        uint256 amount = (size * difference) / p.entryPrice;
+
+        bool profit = p.isLong
+            ? current >= p.entryPrice
+            : current <= p.entryPrice;
+
+        return profit ? int256(amount) : -int256(amount);
+    }
+
+    // Close position
+    function closePosition(uint256 market) external {
+        Position memory p = positions[msg.sender][market];
+        require(p.open, "No position");
+
+        int256 pnl = getPnL(msg.sender, market);
+
+        delete positions[msg.sender][market];
+
+        uint256 payout;
+
+        if (pnl >= 0) {
+            payout = p.margin + uint256(pnl);
+            totalProfit[msg.sender] += uint256(pnl);
+        } else {
+            uint256 loss = uint256(-pnl);
+            payout = loss >= p.margin ? 0 : p.margin - loss;
+        }
+
+        if (payout > 0) {
+            require(
+                collateral.transfer(msg.sender, payout),
+                "Payout failed"
+            );
+        }
+
+        emit PositionClosed(msg.sender, market, pnl);
+    }
+
+    function changeAdmin(address newAdmin) external onlyAdmin {
+        require(newAdmin != address(0), "Zero address");
+        admin = newAdmin;
+    }
+}
